@@ -1,4 +1,4 @@
-export function distanceBetween(a, b) {
+function distanceBetween(a, b) {
   const rad = (value) => (value * Math.PI) / 180;
   const dLat = rad(b.latitude - a.latitude);
   const dLon = rad(b.longitude - a.longitude);
@@ -25,3 +25,4 @@ export function isValidRide(ride) {
     )
   );
 }
+module.exports = { distanceBetween, calculateDistance, isValidRide };
