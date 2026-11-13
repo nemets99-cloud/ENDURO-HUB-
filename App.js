@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, View, Pressable, Alert } from 'react-native';
+import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TextInput, View, Pressable, Alert } from 'react-native';
 import MapView, { Marker, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -8,6 +8,8 @@ import * as Sharing from 'expo-sharing';
 import { distanceBetween, calculateDistance, isValidRide } from './rideUtils';
 
 const STORAGE_KEY = 'enduro-hub-rides-v1';
+const GARAGE_KEY = 'enduro-hub-garage-v1';
+const SERVICE_KEY = 'enduro-hub-service-v1';
 const INITIAL_REGION = { latitude: 47.2692, longitude: 11.4041, latitudeDelta: 0.08, longitudeDelta: 0.08 };
 
 function formatDistance(meters) {
@@ -28,6 +30,12 @@ export default function App() {
   const [recording, setRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [savedRides, setSavedRides] = useState([]);
+  const [bike, setBike] = useState({ make: '', model: '', year: '', hours: '' });
+  const [serviceEntries, setServiceEntries] = useState([]);
+  const [serviceTitle, setServiceTitle] = useState('');
+  const [serviceDate, setServiceDate] = useState(new Date().toISOString().slice(0, 10));
+  const [serviceHours, setServiceHours] = useState('');
+  const [serviceNotes, setServiceNotes] = useState('');
   const [loading, setLoading] = useState(false);
   const watchRef = useRef(null);
   const startedAtRef = useRef(null);
@@ -49,6 +57,21 @@ export default function App() {
     return () => {
       if (watchRef.current) watchRef.current.remove();
     };
+  }, []);
+
+  useEffect(() => {
+    Promise.all([AsyncStorage.getItem(GARAGE_KEY), AsyncStorage.getItem(SERVICE_KEY)])
+      .then(([garageValue, serviceValue]) => {
+        if (garageValue) {
+          const parsed = JSON.parse(garageValue);
+          if (parsed && typeof parsed === 'object') setBike({ make: parsed.make || '', model: parsed.model || '', year: parsed.year || '', hours: parsed.hours || '' });
+        }
+        if (serviceValue) {
+          const parsed = JSON.parse(serviceValue);
+          if (Array.isArray(parsed)) setServiceEntries(parsed.filter((entry) => entry && typeof entry.id === 'string' && typeof entry.title === 'string'));
+        }
+      })
+      .catch(() => Alert.alert('Ошибка данных', 'Не удалось загрузить гараж или журнал обслуживания.'));
   }, []);
 
   useEffect(() => {
@@ -228,6 +251,33 @@ ${pointsXml}
     setScreen('map');
   }
 
+  async function saveBike() {
+    try {
+      await AsyncStorage.setItem(GARAGE_KEY, JSON.stringify(bike));
+      Alert.alert('Гараж сохранён', 'Данные мотоцикла сохранены на этом телефоне.');
+    } catch {
+      Alert.alert('Ошибка сохранения', 'Не удалось сохранить данные мотоцикла.');
+    }
+  }
+
+  async function addServiceEntry() {
+    if (!serviceTitle.trim()) {
+      Alert.alert('Заполни работу', 'Укажи, какое обслуживание было выполнено.');
+      return;
+    }
+    const entry = { id: String(Date.now()), title: serviceTitle.trim(), date: serviceDate, hours: serviceHours.trim(), notes: serviceNotes.trim() };
+    const updated = [entry, ...serviceEntries].slice(0, 100);
+    try {
+      await AsyncStorage.setItem(SERVICE_KEY, JSON.stringify(updated));
+      setServiceEntries(updated);
+      setServiceTitle('');
+      setServiceHours('');
+      setServiceNotes('');
+    } catch {
+      Alert.alert('Ошибка сохранения', 'Не удалось добавить запись в журнал ТО.');
+    }
+  }
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor="#10130F" />
@@ -264,7 +314,7 @@ ${pointsXml}
             <Text style={styles.hint}>{recording ? 'Идёт запись GPS. Не закрывай приложение.' : 'Нажми, чтобы начать запись нового маршрута.'}</Text>
           </View>
         </View>
-      ) : (
+      ) : screen === 'home' ? (
         <ScrollView contentContainerStyle={styles.container}>
           <View style={styles.header}>
             <View><Text style={styles.eyebrow}>СООБЩЕСТВО ЭНДУРО</Text><Text style={styles.logo}>ENDURO<Text style={styles.logoAccent}> HUB</Text></Text></View>
@@ -283,21 +333,21 @@ ${pointsXml}
             <View style={styles.cardCopy}><Text style={styles.cardTag}>НАВИГАЦИЯ</Text><Text style={styles.cardTitle}>GPS-маршруты</Text><Text style={styles.cardSubtitle}>Карта, запись и сохранение трека</Text></View>
             <Text style={styles.chevron}>›</Text>
           </Pressable>
-          <View style={styles.card}>
+          <Pressable style={styles.card} onPress={() => setScreen('diary')}>
             <View style={styles.cardIcon}><Text style={styles.iconText}>📍</Text></View>
             <View style={styles.cardCopy}><Text style={styles.cardTag}>ПОЕЗДКИ</Text><Text style={styles.cardTitle}>Дневник поездок</Text><Text style={styles.cardSubtitle}>История твоих выездов</Text></View>
             <Text style={styles.chevron}>›</Text>
-          </View>
-          <View style={styles.card}>
+          </Pressable>
+          <Pressable style={styles.card} onPress={() => setScreen('garage')}>
             <View style={styles.cardIcon}><Text style={styles.iconText}>🏍️</Text></View>
             <View style={styles.cardCopy}><Text style={styles.cardTag}>ТЕХНИКА</Text><Text style={styles.cardTitle}>Мой гараж</Text><Text style={styles.cardSubtitle}>Мотоцикл и моточасы</Text></View>
             <Text style={styles.chevron}>›</Text>
-          </View>
-          <View style={styles.card}>
+          </Pressable>
+          <Pressable style={styles.card} onPress={() => setScreen('service')}>
             <View style={styles.cardIcon}><Text style={styles.iconText}>🔧</Text></View>
             <View style={styles.cardCopy}><Text style={styles.cardTag}>СЕРВИС</Text><Text style={styles.cardTitle}>Обслуживание</Text><Text style={styles.cardSubtitle}>Расходники и напоминания о ТО</Text></View>
             <Text style={styles.chevron}>›</Text>
-          </View>
+          </Pressable>
           <View style={styles.sectionHeading}><Text style={styles.sectionTitle}>СОХРАНЁННЫЕ ПОЕЗДКИ</Text><Text style={styles.sectionHint}>{savedRides.length} ШТ.</Text></View>
           {savedRides.length === 0 ? <Text style={styles.emptyText}>Пока нет поездок. Запиши свой первый маршрут!</Text> : savedRides.map((ride) => (
             <View key={ride.id} style={styles.savedRide}>
@@ -311,6 +361,65 @@ ${pointsXml}
             </View>
           ))}
           <View style={styles.footer}><Text style={styles.footerTitle}>RIDE YOUR WAY</Text><Text style={styles.footerText}>Создано для тех, кто выбирает бездорожье.</Text></View>
+        </ScrollView>
+      ) : (
+        <ScrollView contentContainerStyle={styles.container}>
+          <View style={styles.mapHeader}>
+            <Pressable onPress={() => setScreen('home')} style={styles.backButton}><Text style={styles.backText}>‹  НАЗАД</Text></Pressable>
+            <Text style={styles.mapTitle}>{screen === 'diary' ? 'ДНЕВНИК' : screen === 'garage' ? 'МОЙ ГАРАЖ' : 'ОБСЛУЖИВАНИЕ'}</Text>
+            <View style={{ width: 70 }} />
+          </View>
+          {screen === 'diary' ? (
+            <>
+              <Text style={styles.sectionTitle}>ИСТОРИЯ ПОЕЗДОК</Text>
+              {savedRides.length === 0 ? <Text style={styles.emptyText}>Сохранённых поездок пока нет. Запиши маршрут на GPS-карте.</Text> : savedRides.map((ride) => (
+                <View key={ride.id} style={styles.savedRide}>
+                  <Pressable style={styles.savedRideInfo} onPress={() => openRide(ride)}>
+                    <Text style={styles.savedDate}>{ride.date}</Text>
+                    <Text style={styles.savedStats}>{formatDistance(ride.distance)} • {formatDuration(ride.duration)}</Text>
+                  </Pressable>
+                  <Pressable style={styles.exportButton} onPress={() => exportRide(ride)}><Text style={styles.exportButtonText}>GPX ↗</Text></Pressable>
+                </View>
+              ))}
+            </>
+          ) : screen === 'garage' ? (
+            <>
+              <Text style={styles.sectionTitle}>МОЙ МОТОЦИКЛ</Text>
+              <Text style={styles.fieldLabel}>Марка</Text>
+              <TextInput style={styles.field} value={bike.make} onChangeText={(make) => setBike((old) => ({ ...old, make }))} placeholder="Например, KTM" placeholderTextColor="#77816D" />
+              <Text style={styles.fieldLabel}>Модель</Text>
+              <TextInput style={styles.field} value={bike.model} onChangeText={(model) => setBike((old) => ({ ...old, model }))} placeholder="Например, EXC 300" placeholderTextColor="#77816D" />
+              <Text style={styles.fieldLabel}>Год выпуска</Text>
+              <TextInput style={styles.field} value={bike.year} onChangeText={(year) => setBike((old) => ({ ...old, year }))} placeholder="2024" keyboardType="number-pad" placeholderTextColor="#77816D" />
+              <Text style={styles.fieldLabel}>Моточасы</Text>
+              <TextInput style={styles.field} value={bike.hours} onChangeText={(hours) => setBike((old) => ({ ...old, hours }))} placeholder="Например, 86.5" keyboardType="decimal-pad" placeholderTextColor="#77816D" />
+              <Pressable style={styles.primaryButton} onPress={saveBike}><Text style={styles.primaryButtonText}>СОХРАНИТЬ МОТОЦИКЛ</Text></Pressable>
+              <Text style={styles.hint}>Данные хранятся локально на телефоне.</Text>
+            </>
+          ) : (
+            <>
+              <Text style={styles.sectionTitle}>ДОБАВИТЬ ОБСЛУЖИВАНИЕ</Text>
+              <Text style={styles.fieldLabel}>Что сделано</Text>
+              <TextInput style={styles.field} value={serviceTitle} onChangeText={setServiceTitle} placeholder="Замена масла, фильтра…" placeholderTextColor="#77816D" />
+              <Text style={styles.fieldLabel}>Дата (ГГГГ-ММ-ДД)</Text>
+              <TextInput style={styles.field} value={serviceDate} onChangeText={setServiceDate} placeholder="2026-11-13" placeholderTextColor="#77816D" />
+              <Text style={styles.fieldLabel}>Моточасы на момент ТО</Text>
+              <TextInput style={styles.field} value={serviceHours} onChangeText={setServiceHours} keyboardType="decimal-pad" placeholder="Например, 90" placeholderTextColor="#77816D" />
+              <Text style={styles.fieldLabel}>Заметки</Text>
+              <TextInput style={[styles.field, styles.notesField]} value={serviceNotes} onChangeText={setServiceNotes} multiline placeholder="Запчасти, объём масла, детали…" placeholderTextColor="#77816D" />
+              <Pressable style={styles.primaryButton} onPress={addServiceEntry}><Text style={styles.primaryButtonText}>ДОБАВИТЬ В ЖУРНАЛ</Text></Pressable>
+              <Text style={[styles.sectionTitle, { marginTop: 26 }]}>ИСТОРИЯ ТО</Text>
+              {serviceEntries.length === 0 ? <Text style={styles.emptyText}>Записей пока нет.</Text> : serviceEntries.map((entry) => (
+                <View key={entry.id} style={styles.savedRide}>
+                  <View style={styles.savedRideInfo}>
+                    <Text style={styles.savedDate}>{entry.date}{entry.hours ? ' • ' + entry.hours + ' м/ч' : ''}</Text>
+                    <Text style={styles.savedStats}>{entry.title}</Text>
+                    {!!entry.notes && <Text style={styles.cardSubtitle}>{entry.notes}</Text>}
+                  </View>
+                </View>
+              ))}
+            </>
+          )}
         </ScrollView>
       )}
     </SafeAreaView>
@@ -368,4 +477,7 @@ const styles = StyleSheet.create({
   exportButtonText: { color: '#B6F23B', fontSize: 10, fontWeight: '900', letterSpacing: 0.5 },
   savedDate: { color: '#A6B09C', fontSize: 10 },
   savedStats: { color: '#F4F5F0', fontSize: 14, fontWeight: '800', marginTop: 5 },
+  fieldLabel: { color: '#9BB36B', fontSize: 10, fontWeight: '800', marginTop: 16, marginBottom: 6, letterSpacing: 0.8 },
+  field: { backgroundColor: '#1A1F18', borderColor: '#3D4B2D', borderWidth: 1, borderRadius: 10, color: '#F4F5F0', paddingHorizontal: 13, paddingVertical: 12, fontSize: 14 },
+  notesField: { minHeight: 90, textAlignVertical: 'top' },
 });
