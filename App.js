@@ -1,58 +1,230 @@
-import React from 'react';
-import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, View, Pressable } from 'react-native';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, View, Pressable, Alert } from 'react-native';
+import MapView, { Marker, Polyline } from 'react-native-maps';
+import * as Location from 'expo-location';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const sections = [
-  { icon: '🧭', title: 'Маршруты', subtitle: 'Ищи трассы и сохраняй треки', tag: 'НАВИГАЦИЯ' },
-  { icon: '📍', title: 'Дневник поездок', subtitle: 'История выездов и впечатления', tag: 'ПОЕЗДКИ' },
-  { icon: '🏍️', title: 'Мой гараж', subtitle: 'Мотоцикл, настройки и моточасы', tag: 'ТЕХНИКА' },
-  { icon: '🔧', title: 'Обслуживание', subtitle: 'Следи за расходниками и ТО', tag: 'СЕРВИС' },
-];
+const STORAGE_KEY = 'enduro-hub-rides-v1';
+const INITIAL_REGION = { latitude: 47.2692, longitude: 11.4041, latitudeDelta: 0.08, longitudeDelta: 0.08 };
+
+function distanceBetween(a, b) {
+  const rad = (v) => (v * Math.PI) / 180;
+  const dLat = rad(b.latitude - a.latitude);
+  const dLon = rad(b.longitude - a.longitude);
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.latitude)) * Math.cos(rad(b.latitude)) * Math.sin(dLon / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+function formatDistance(meters) {
+  return meters >= 1000 ? (meters / 1000).toFixed(2) + ' км' : Math.round(meters) + ' м';
+}
+function formatDuration(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  return [h, m, s].map((v) => String(v).padStart(2, '0')).join(':');
+}
 
 export default function App() {
+  const [screen, setScreen] = useState('home');
+  const [permission, setPermission] = useState('unknown');
+  const [current, setCurrent] = useState(null);
+  const [track, setTrack] = useState([]);
+  const [recording, setRecording] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [savedRides, setSavedRides] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const watchRef = useRef(null);
+  const startedAtRef = useRef(null);
+  const mapRef = useRef(null);
+
+  const distance = useMemo(() => track.reduce((sum, point, i) => i ? sum + distanceBetween(track[i - 1], point) : 0, 0), [track]);
+
+  useEffect(() => {
+    AsyncStorage.getItem(STORAGE_KEY).then((value) => {
+      if (value) setSavedRides(JSON.parse(value));
+    }).catch(() => {});
+    return () => {
+      if (watchRef.current) watchRef.current.remove();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!recording) return;
+    const timer = setInterval(() => {
+      if (startedAtRef.current) setElapsed(Math.floor((Date.now() - startedAtRef.current) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [recording]);
+
+  async function getLocationPermission() {
+    const result = await Location.requestForegroundPermissionsAsync();
+    setPermission(result.status);
+    if (result.status !== 'granted') {
+      Alert.alert('Нужен доступ к GPS', 'Разреши приложению доступ к местоположению, чтобы показывать карту и записывать трек.');
+      return false;
+    }
+    return true;
+  }
+
+  async function openMap() {
+    setScreen('map');
+    const allowed = await getLocationPermission();
+    if (!allowed) return;
+    try {
+      const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      const point = { latitude: position.coords.latitude, longitude: position.coords.longitude };
+      setCurrent(point);
+      mapRef.current?.animateToRegion({ ...point, latitudeDelta: 0.015, longitudeDelta: 0.015 }, 700);
+    } catch {
+      Alert.alert('Не удалось определить место', 'Проверь GPS и попробуй ещё раз.');
+    }
+  }
+
+  async function startRecording() {
+    const allowed = await getLocationPermission();
+    if (!allowed) return;
+    setLoading(true);
+    try {
+      const first = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      const firstPoint = { latitude: first.coords.latitude, longitude: first.coords.longitude, timestamp: first.timestamp };
+      setTrack([firstPoint]);
+      setCurrent(firstPoint);
+      setElapsed(0);
+      startedAtRef.current = Date.now();
+      setRecording(true);
+      watchRef.current = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.High, timeInterval: 3000, distanceInterval: 5 },
+        (position) => {
+          const point = { latitude: position.coords.latitude, longitude: position.coords.longitude, timestamp: position.timestamp };
+          setCurrent(point);
+          setTrack((previous) => {
+            const last = previous[previous.length - 1];
+            if (last && distanceBetween(last, point) < 3) return previous;
+            return [...previous, point];
+          });
+        }
+      );
+    } catch {
+      Alert.alert('Ошибка GPS', 'Не удалось начать запись. Проверь разрешения и включённую геолокацию.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function stopRecording() {
+    if (watchRef.current) {
+      watchRef.current.remove();
+      watchRef.current = null;
+    }
+    setRecording(false);
+    const ride = {
+      id: String(Date.now()),
+      date: new Date().toLocaleString(),
+      distance,
+      duration: elapsed,
+      points: track,
+    };
+    if (track.length > 1) {
+      const updated = [ride, ...savedRides].slice(0, 30);
+      setSavedRides(updated);
+      try {
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+        Alert.alert('Поездка сохранена', `Трек: ${formatDistance(distance)} • ${formatDuration(elapsed)}`);
+      } catch {
+        Alert.alert('Поездка завершена', 'Не удалось сохранить трек в памяти телефона.');
+      }
+    } else {
+      Alert.alert('Запись остановлена', 'GPS-точек пока недостаточно для сохранения маршрута.');
+    }
+    startedAtRef.current = null;
+  }
+
+  function openRide(ride) {
+    setTrack(ride.points || []);
+    setCurrent(ride.points?.[ride.points.length - 1] || null);
+    setScreen('map');
+    setRecording(false);
+  }
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor="#10130F" />
-      <ScrollView contentContainerStyle={styles.container}>
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.eyebrow}>СООБЩЕСТВО ЭНДУРО</Text>
-            <Text style={styles.logo}>ENDURO<Text style={styles.logoAccent}> HUB</Text></Text>
+      {screen === 'map' ? (
+        <View style={styles.mapScreen}>
+          <View style={styles.mapHeader}>
+            <Pressable onPress={() => setScreen('home')} style={styles.backButton}><Text style={styles.backText}>‹  НАЗАД</Text></Pressable>
+            <Text style={styles.mapTitle}>GPS-МАРШРУТ</Text>
+            <View style={{ width: 70 }} />
           </View>
-          <View style={styles.avatar}><Text style={styles.avatarText}>R</Text></View>
-        </View>
-
-        <View style={styles.hero}>
-          <Text style={styles.heroLabel}>ТВОЯ СЛЕДУЮЩАЯ ПРИКЛЮЧЕНИЕ</Text>
-          <Text style={styles.heroTitle}>ГРЯЗЬ. ТРАССА. СВОБОДА.</Text>
-          <Text style={styles.heroText}>Всё для эндуро — в одном месте.</Text>
-          <Pressable style={styles.primaryButton} onPress={() => {}}>
-            <Text style={styles.primaryButtonText}>НАЧАТЬ ПОЕЗДКУ  →</Text>
-          </Pressable>
-          <Text style={styles.heroMark}>🏁</Text>
-        </View>
-
-        <View style={styles.sectionHeading}>
-          <Text style={styles.sectionTitle}>ТВОЙ ЭНДУРО МИР</Text>
-          <Text style={styles.sectionHint}>ВЫБЕРИ РАЗДЕЛ</Text>
-        </View>
-
-        {sections.map((item) => (
-          <Pressable key={item.title} style={styles.card} onPress={() => {}}>
-            <View style={styles.cardIcon}><Text style={styles.iconText}>{item.icon}</Text></View>
-            <View style={styles.cardCopy}>
-              <Text style={styles.cardTag}>{item.tag}</Text>
-              <Text style={styles.cardTitle}>{item.title}</Text>
-              <Text style={styles.cardSubtitle}>{item.subtitle}</Text>
+          <MapView
+            ref={mapRef}
+            style={styles.map}
+            initialRegion={current ? { ...current, latitudeDelta: 0.03, longitudeDelta: 0.03 } : INITIAL_REGION}
+            showsUserLocation
+            showsMyLocationButton
+            mapType="terrain"
+          >
+            {track.length > 0 && <Polyline coordinates={track} strokeColor="#B6F23B" strokeWidth={5} />}
+            {track.length > 0 && <Marker coordinate={track[0]} title="Старт" pinColor="green" />}
+            {current && <Marker coordinate={current} title="Текущее положение" />}
+          </MapView>
+          <View style={styles.recordPanel}>
+            <View style={styles.statsRow}>
+              <View><Text style={styles.statLabel}>ДИСТАНЦИЯ</Text><Text style={styles.statValue}>{formatDistance(distance)}</Text></View>
+              <View><Text style={styles.statLabel}>ВРЕМЯ</Text><Text style={styles.statValue}>{formatDuration(elapsed)}</Text></View>
+              <View><Text style={styles.statLabel}>ТОЧКИ GPS</Text><Text style={styles.statValue}>{track.length}</Text></View>
             </View>
+            {recording ? (
+              <Pressable style={[styles.recordButton, styles.stopButton]} onPress={stopRecording}><Text style={styles.recordButtonText}>■  ОСТАНОВИТЬ И СОХРАНИТЬ</Text></Pressable>
+            ) : (
+              <Pressable style={styles.recordButton} disabled={loading} onPress={startRecording}><Text style={styles.recordButtonText}>{loading ? 'ПОЛУЧАЮ GPS…' : '●  НАЧАТЬ ЗАПИСЬ'}</Text></Pressable>
+            )}
+            <Text style={styles.hint}>{recording ? 'Идёт запись GPS. Не закрывай приложение.' : 'Нажми, чтобы начать запись нового маршрута.'}</Text>
+          </View>
+        </View>
+      ) : (
+        <ScrollView contentContainerStyle={styles.container}>
+          <View style={styles.header}>
+            <View><Text style={styles.eyebrow}>СООБЩЕСТВО ЭНДУРО</Text><Text style={styles.logo}>ENDURO<Text style={styles.logoAccent}> HUB</Text></Text></View>
+            <View style={styles.avatar}><Text style={styles.avatarText}>R</Text></View>
+          </View>
+          <View style={styles.hero}>
+            <Text style={styles.heroLabel}>ТВОЯ СЛЕДУЮЩАЯ ПРИКЛЮЧЕНИЕ</Text>
+            <Text style={styles.heroTitle}>ГРЯЗЬ. ТРАССА. СВОБОДА.</Text>
+            <Text style={styles.heroText}>Всё для эндуро — в одном месте.</Text>
+            <Pressable style={styles.primaryButton} onPress={openMap}><Text style={styles.primaryButtonText}>НАЧАТЬ ПОЕЗДКУ  →</Text></Pressable>
+            <Text style={styles.heroMark}>🏁</Text>
+          </View>
+          <View style={styles.sectionHeading}><Text style={styles.sectionTitle}>ТВОЙ ЭНДУРО МИР</Text><Text style={styles.sectionHint}>ВЫБЕРИ РАЗДЕЛ</Text></View>
+          <Pressable style={styles.card} onPress={openMap}>
+            <View style={styles.cardIcon}><Text style={styles.iconText}>🧭</Text></View>
+            <View style={styles.cardCopy}><Text style={styles.cardTag}>НАВИГАЦИЯ</Text><Text style={styles.cardTitle}>GPS-маршруты</Text><Text style={styles.cardSubtitle}>Карта, запись и сохранение трека</Text></View>
             <Text style={styles.chevron}>›</Text>
           </Pressable>
-        ))}
-
-        <View style={styles.footer}>
-          <Text style={styles.footerTitle}>RIDE YOUR WAY</Text>
-          <Text style={styles.footerText}>Создано для тех, кто выбирает бездорожье.</Text>
-        </View>
-      </ScrollView>
+          <View style={styles.card}>
+            <View style={styles.cardIcon}><Text style={styles.iconText}>📍</Text></View>
+            <View style={styles.cardCopy}><Text style={styles.cardTag}>ПОЕЗДКИ</Text><Text style={styles.cardTitle}>Дневник поездок</Text><Text style={styles.cardSubtitle}>История твоих выездов</Text></View>
+            <Text style={styles.chevron}>›</Text>
+          </View>
+          <View style={styles.card}>
+            <View style={styles.cardIcon}><Text style={styles.iconText}>🏍️</Text></View>
+            <View style={styles.cardCopy}><Text style={styles.cardTag}>ТЕХНИКА</Text><Text style={styles.cardTitle}>Мой гараж</Text><Text style={styles.cardSubtitle}>Мотоцикл и моточасы</Text></View>
+            <Text style={styles.chevron}>›</Text>
+          </View>
+          <View style={styles.card}>
+            <View style={styles.cardIcon}><Text style={styles.iconText}>🔧</Text></View>
+            <View style={styles.cardCopy}><Text style={styles.cardTag}>СЕРВИС</Text><Text style={styles.cardTitle}>Обслуживание</Text><Text style={styles.cardSubtitle}>Расходники и напоминания о ТО</Text></View>
+            <Text style={styles.chevron}>›</Text>
+          </View>
+          <View style={styles.sectionHeading}><Text style={styles.sectionTitle}>СОХРАНЁННЫЕ ПОЕЗДКИ</Text><Text style={styles.sectionHint}>{savedRides.length} ШТ.</Text></View>
+          {savedRides.length === 0 ? <Text style={styles.emptyText}>Пока нет поездок. Запиши свой первый маршрут!</Text> : savedRides.map((ride) => (
+            <Pressable key={ride.id} style={styles.savedRide} onPress={() => openRide(ride)}>
+              <View style={{ flex: 1 }}><Text style={styles.savedDate}>{ride.date}</Text><Text style={styles.savedStats}>{formatDistance(ride.distance)}  •  {formatDuration(ride.duration)}</Text></View><Text style={styles.chevron}>›</Text>
+            </Pressable>
+          ))}
+          <View style={styles.footer}><Text style={styles.footerTitle}>RIDE YOUR WAY</Text><Text style={styles.footerText}>Создано для тех, кто выбирает бездорожье.</Text></View>
+        </ScrollView>
+      )}
     </SafeAreaView>
   );
 }
@@ -73,7 +245,7 @@ const styles = StyleSheet.create({
   primaryButton: { backgroundColor: '#B6F23B', paddingVertical: 13, paddingHorizontal: 16, borderRadius: 9, alignSelf: 'flex-start', marginTop: 20 },
   primaryButtonText: { color: '#17200E', fontSize: 11, fontWeight: '900', letterSpacing: 0.8 },
   heroMark: { position: 'absolute', right: 8, bottom: 8, fontSize: 78, opacity: 0.18 },
-  sectionHeading: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  sectionHeading: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, marginTop: 8 },
   sectionTitle: { color: '#F3F5EE', fontSize: 14, fontWeight: '900', letterSpacing: 0.8 },
   sectionHint: { color: '#77816D', fontSize: 8, fontWeight: '800', letterSpacing: 1 },
   card: { backgroundColor: '#1A1F18', borderRadius: 15, borderWidth: 1, borderColor: '#2D3528', padding: 14, flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
@@ -87,4 +259,22 @@ const styles = StyleSheet.create({
   footer: { alignItems: 'center', marginTop: 24 },
   footerTitle: { color: '#65734F', fontSize: 10, fontWeight: '900', letterSpacing: 3 },
   footerText: { color: '#697263', fontSize: 10, marginTop: 6 },
+  mapScreen: { flex: 1 },
+  mapHeader: { height: 56, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#10130F' },
+  backButton: { width: 70 },
+  backText: { color: '#B6F23B', fontSize: 11, fontWeight: '900' },
+  mapTitle: { color: '#F4F5F0', fontSize: 13, fontWeight: '900', letterSpacing: 1.4 },
+  map: { flex: 1 },
+  recordPanel: { backgroundColor: '#171D14', padding: 18, borderTopWidth: 1, borderColor: '#36432B' },
+  statsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 16 },
+  statLabel: { color: '#8B977F', fontSize: 8, fontWeight: '800', letterSpacing: 1 },
+  statValue: { color: '#F4F5F0', fontSize: 19, fontWeight: '900', marginTop: 5 },
+  recordButton: { backgroundColor: '#B6F23B', borderRadius: 11, alignItems: 'center', paddingVertical: 16 },
+  stopButton: { backgroundColor: '#D95B4B' },
+  recordButtonText: { color: '#17200E', fontSize: 12, fontWeight: '900', letterSpacing: 0.6 },
+  hint: { color: '#8B9582', textAlign: 'center', fontSize: 10, marginTop: 10 },
+  emptyText: { color: '#8B9582', fontSize: 12, paddingVertical: 14 },
+  savedRide: { backgroundColor: '#1A1F18', borderRadius: 12, padding: 14, flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  savedDate: { color: '#A6B09C', fontSize: 10 },
+  savedStats: { color: '#F4F5F0', fontSize: 14, fontWeight: '800', marginTop: 5 },
 });
