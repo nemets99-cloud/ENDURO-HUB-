@@ -7,12 +7,12 @@ function distanceBetween(a, b) {
   return 6371000 * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
-export function calculateDistance(points) {
+function calculateDistance(points) {
   return points.reduce((sum, point, index) =>
     index ? sum + distanceBetween(points[index - 1], point) : 0, 0);
 }
 
-export function isValidRide(ride) {
+function isValidRide(ride) {
   return Boolean(
     ride &&
     typeof ride.id === 'string' &&
