@@ -3,6 +3,8 @@ import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, View, Pressable,
 import MapView, { Marker, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 
 const STORAGE_KEY = 'enduro-hub-rides-v1';
 const INITIAL_REGION = { latitude: 47.2692, longitude: 11.4041, latitudeDelta: 0.08, longitudeDelta: 0.08 };
@@ -139,6 +141,42 @@ export default function App() {
     startedAtRef.current = null;
   }
 
+  async function exportRide(ride) {
+    if (!ride?.points || ride.points.length < 2) {
+      Alert.alert('Нельзя экспортировать', 'В этом маршруте недостаточно GPS-точек.');
+      return;
+    }
+    try {
+      const escapeXml = (value) => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+      const pointsXml = ride.points.map((point) => {
+        const timestamp = point.timestamp ? new Date(point.timestamp).toISOString() : new Date().toISOString();
+        return `      <trkpt lat="${point.latitude}" lon="${point.longitude}"><time>${timestamp}</time></trkpt>`;
+      }).join('\n');
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="ENDURO HUB" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>${escapeXml('Поездка ' + ride.date)}</name></metadata>
+  <trk><name>${escapeXml('ENDURO HUB — ' + ride.date)}</name><trkseg>
+${pointsXml}
+  </trkseg></trk>
+</gpx>`;
+      const safeDate = new Date().toISOString().replace(/[:.]/g, '-');
+      const uri = FileSystem.cacheDirectory + `enduro-hub-${safeDate}.gpx`;
+      await FileSystem.writeAsStringAsync(uri, xml, { encoding: FileSystem.EncodingType.UTF8 });
+      const available = await Sharing.isAvailableAsync();
+      if (!available) {
+        Alert.alert('Поделиться нельзя', 'На этом устройстве функция отправки файлов недоступна.');
+        return;
+      }
+      await Sharing.shareAsync(uri, {
+        mimeType: 'application/gpx+xml',
+        dialogTitle: 'Поделиться GPS-маршрутом',
+        UTI: 'com.topografix.gpx',
+      });
+    } catch (error) {
+      Alert.alert('Ошибка экспорта', 'Не удалось создать GPX-файл. Попробуй ещё раз.');
+    }
+  }
+
   function openRide(ride) {
     setTrack(ride.points || []);
     setCurrent(ride.points?.[ride.points.length - 1] || null);
@@ -218,9 +256,15 @@ export default function App() {
           </View>
           <View style={styles.sectionHeading}><Text style={styles.sectionTitle}>СОХРАНЁННЫЕ ПОЕЗДКИ</Text><Text style={styles.sectionHint}>{savedRides.length} ШТ.</Text></View>
           {savedRides.length === 0 ? <Text style={styles.emptyText}>Пока нет поездок. Запиши свой первый маршрут!</Text> : savedRides.map((ride) => (
-            <Pressable key={ride.id} style={styles.savedRide} onPress={() => openRide(ride)}>
-              <View style={{ flex: 1 }}><Text style={styles.savedDate}>{ride.date}</Text><Text style={styles.savedStats}>{formatDistance(ride.distance)}  •  {formatDuration(ride.duration)}</Text></View><Text style={styles.chevron}>›</Text>
-            </Pressable>
+            <View key={ride.id} style={styles.savedRide}>
+              <Pressable style={styles.savedRideInfo} onPress={() => openRide(ride)}>
+                <Text style={styles.savedDate}>{ride.date}</Text>
+                <Text style={styles.savedStats}>{formatDistance(ride.distance)}  •  {formatDuration(ride.duration)}</Text>
+              </Pressable>
+              <Pressable style={styles.exportButton} onPress={() => exportRide(ride)}>
+                <Text style={styles.exportButtonText}>GPX ↗</Text>
+              </Pressable>
+            </View>
           ))}
           <View style={styles.footer}><Text style={styles.footerTitle}>RIDE YOUR WAY</Text><Text style={styles.footerText}>Создано для тех, кто выбирает бездорожье.</Text></View>
         </ScrollView>
@@ -274,7 +318,10 @@ const styles = StyleSheet.create({
   recordButtonText: { color: '#17200E', fontSize: 12, fontWeight: '900', letterSpacing: 0.6 },
   hint: { color: '#8B9582', textAlign: 'center', fontSize: 10, marginTop: 10 },
   emptyText: { color: '#8B9582', fontSize: 12, paddingVertical: 14 },
-  savedRide: { backgroundColor: '#1A1F18', borderRadius: 12, padding: 14, flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  savedRide: { backgroundColor: '#1A1F18', borderRadius: 12, padding: 12, flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  savedRideInfo: { flex: 1, paddingVertical: 2 },
+  exportButton: { backgroundColor: '#293322', borderWidth: 1, borderColor: '#52633B', borderRadius: 8, paddingVertical: 9, paddingHorizontal: 12, marginLeft: 10 },
+  exportButtonText: { color: '#B6F23B', fontSize: 10, fontWeight: '900', letterSpacing: 0.5 },
   savedDate: { color: '#A6B09C', fontSize: 10 },
   savedStats: { color: '#F4F5F0', fontSize: 14, fontWeight: '800', marginTop: 5 },
 });
