@@ -16,6 +16,18 @@
     },
     "ios": {
       "supportsTablet": true
-    }
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "ENDURO HUB использует геолокацию для записи маршрута во время поездки, даже когда экран выключен.",
+          "locationWhenInUsePermission": "ENDURO HUB использует геолокацию, чтобы показывать ваше положение и записывать маршрут.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true,
+          "isIosBackgroundLocationEnabled": true
+        }
+      ]
+    ]
   }
 }

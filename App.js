@@ -1,12 +1,40 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, View, Pressable, Alert } from 'react-native';
+import { SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, View, Pressable, Alert, Platform } from 'react-native';
 import MapView, { Marker, Polyline } from 'react-native-maps';
 import * as Location from 'expo-location';
+import * as TaskManager from 'expo-task-manager';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 
 const STORAGE_KEY = 'enduro-hub-rides-v1';
+const ACTIVE_TRACK_KEY = 'enduro-hub-active-track-v1';
+const LOCATION_TASK = 'enduro-hub-background-location';
+
+// Registered at module load so Android can deliver GPS points while the UI is closed.
+TaskManager.defineTask(LOCATION_TASK, async ({ data, error }) => {
+  if (error || !data?.locations?.length) return;
+  try {
+    const raw = await AsyncStorage.getItem(ACTIVE_TRACK_KEY);
+    if (!raw) return;
+    const active = JSON.parse(raw);
+    const points = active.points || [];
+    for (const location of data.locations) {
+      const point = {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+        timestamp: location.timestamp,
+        accuracy: location.coords.accuracy,
+        speed: location.coords.speed,
+      };
+      const last = points[points.length - 1];
+      if (!last || distanceBetween(last, point) >= 3) points.push(point);
+    }
+    active.points = points;
+    active.updatedAt = Date.now();
+    await AsyncStorage.setItem(ACTIVE_TRACK_KEY, JSON.stringify(active));
+  } catch (_) {}
+});
 const INITIAL_REGION = { latitude: 47.2692, longitude: 11.4041, latitudeDelta: 0.08, longitudeDelta: 0.08 };
 
 function distanceBetween(a, b) {
@@ -45,6 +73,20 @@ export default function App() {
     AsyncStorage.getItem(STORAGE_KEY).then((value) => {
       if (value) setSavedRides(JSON.parse(value));
     }).catch(() => {});
+    (async () => {
+      try {
+        const registered = await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK);
+        const raw = await AsyncStorage.getItem(ACTIVE_TRACK_KEY);
+        if (registered && raw) {
+          const active = JSON.parse(raw);
+          setTrack(active.points || []);
+          setCurrent(active.points?.[active.points.length - 1] || null);
+          startedAtRef.current = active.startedAt;
+          setElapsed(Math.max(0, Math.floor((Date.now() - active.startedAt) / 1000)));
+          setRecording(true);
+        }
+      } catch (_) {}
+    })();
     return () => {
       if (watchRef.current) watchRef.current.remove();
     };
@@ -52,9 +94,20 @@ export default function App() {
 
   useEffect(() => {
     if (!recording) return;
-    const timer = setInterval(() => {
+    const timer = setInterval(async () => {
       if (startedAtRef.current) setElapsed(Math.floor((Date.now() - startedAtRef.current) / 1000));
-    }, 1000);
+      try {
+        const raw = await AsyncStorage.getItem(ACTIVE_TRACK_KEY);
+        if (!raw) return;
+        const active = JSON.parse(raw);
+        const points = active.points || [];
+        setTrack(points);
+        if (points.length) {
+          const last = points[points.length - 1];
+          setCurrent(last);
+        }
+      } catch (_) {}
+    }, 2000);
     return () => clearInterval(timer);
   }, [recording]);
 
@@ -87,58 +140,92 @@ export default function App() {
     if (!allowed) return;
     setLoading(true);
     try {
+      const available = await TaskManager.isAvailableAsync();
+      if (!available) {
+        Alert.alert('Нужна отдельная сборка приложения', 'Фоновая запись GPS не поддерживается в Expo Go. Установи development build или APK приложения.');
+        return;
+      }
+      const background = await Location.requestBackgroundPermissionsAsync();
+      if (background.status !== 'granted') {
+        Alert.alert('Нужен фоновый доступ к GPS', 'Разреши доступ к местоположению «Всегда» в настройках Android. Иначе запись остановится при сворачивании приложения.');
+        return;
+      }
       const first = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-      const firstPoint = { latitude: first.coords.latitude, longitude: first.coords.longitude, timestamp: first.timestamp };
+      const firstPoint = {
+        latitude: first.coords.latitude,
+        longitude: first.coords.longitude,
+        timestamp: first.timestamp,
+        accuracy: first.coords.accuracy,
+        speed: first.coords.speed,
+      };
+      const startedAt = Date.now();
+      const active = { startedAt, points: [firstPoint] };
+      await AsyncStorage.setItem(ACTIVE_TRACK_KEY, JSON.stringify(active));
       setTrack([firstPoint]);
       setCurrent(firstPoint);
       setElapsed(0);
-      startedAtRef.current = Date.now();
+      startedAtRef.current = startedAt;
+      await Location.startLocationUpdatesAsync(LOCATION_TASK, {
+        accuracy: Location.Accuracy.High,
+        timeInterval: 3000,
+        distanceInterval: 5,
+        pausesUpdatesAutomatically: false,
+        showsBackgroundLocationIndicator: true,
+        ...(Platform.OS === 'android' ? {
+          foregroundService: {
+            notificationTitle: 'ENDURO HUB записывает маршрут',
+            notificationBody: 'GPS-трек записывается. Нажми, чтобы вернуться в приложение.',
+            notificationColor: '#B6F23B',
+            killServiceOnDestroy: false,
+          },
+        } : {}),
+      });
       setRecording(true);
-      watchRef.current = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, timeInterval: 3000, distanceInterval: 5 },
-        (position) => {
-          const point = { latitude: position.coords.latitude, longitude: position.coords.longitude, timestamp: position.timestamp };
-          setCurrent(point);
-          setTrack((previous) => {
-            const last = previous[previous.length - 1];
-            if (last && distanceBetween(last, point) < 3) return previous;
-            return [...previous, point];
-          });
-        }
-      );
-    } catch {
-      Alert.alert('Ошибка GPS', 'Не удалось начать запись. Проверь разрешения и включённую геолокацию.');
+    } catch (error) {
+      try { await Location.stopLocationUpdatesAsync(LOCATION_TASK); } catch (_) {}
+      await AsyncStorage.removeItem(ACTIVE_TRACK_KEY);
+      Alert.alert('Ошибка GPS', error?.message || 'Не удалось начать запись. Проверь разрешения и включённую геолокацию.');
     } finally {
       setLoading(false);
     }
   }
 
   async function stopRecording() {
-    if (watchRef.current) {
-      watchRef.current.remove();
-      watchRef.current = null;
-    }
-    setRecording(false);
-    const ride = {
-      id: String(Date.now()),
-      date: new Date().toLocaleString(),
-      distance,
-      duration: elapsed,
-      points: track,
-    };
-    if (track.length > 1) {
-      const updated = [ride, ...savedRides].slice(0, 30);
-      setSavedRides(updated);
-      try {
-        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-        Alert.alert('Поездка сохранена', `Трек: ${formatDistance(distance)} • ${formatDuration(elapsed)}`);
-      } catch {
-        Alert.alert('Поездка завершена', 'Не удалось сохранить трек в памяти телефона.');
+    setLoading(true);
+    try {
+      if (await Location.hasStartedLocationUpdatesAsync(LOCATION_TASK)) {
+        await Location.stopLocationUpdatesAsync(LOCATION_TASK);
       }
-    } else {
-      Alert.alert('Запись остановлена', 'GPS-точек пока недостаточно для сохранения маршрута.');
+      const raw = await AsyncStorage.getItem(ACTIVE_TRACK_KEY);
+      const active = raw ? JSON.parse(raw) : { startedAt: startedAtRef.current || Date.now(), points: track };
+      const points = active.points || track;
+      const duration = Math.max(0, Math.floor((Date.now() - active.startedAt) / 1000));
+      const totalDistance = points.reduce((sum, point, index) => index ? sum + distanceBetween(points[index - 1], point) : 0, 0);
+      setTrack(points);
+      setElapsed(duration);
+      setRecording(false);
+      const ride = {
+        id: String(Date.now()),
+        date: new Date(active.startedAt).toLocaleString(),
+        distance: totalDistance,
+        duration,
+        points,
+      };
+      if (points.length > 1) {
+        const updated = [ride, ...savedRides].slice(0, 30);
+        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
+        setSavedRides(updated);
+        Alert.alert('Поездка сохранена', `Трек: ${formatDistance(totalDistance)} • ${formatDuration(duration)}`);
+      } else {
+        Alert.alert('Запись остановлена', 'GPS-точек пока недостаточно для сохранения маршрута.');
+      }
+      await AsyncStorage.removeItem(ACTIVE_TRACK_KEY);
+      startedAtRef.current = null;
+    } catch (error) {
+      Alert.alert('Ошибка сохранения', error?.message || 'Не удалось завершить и сохранить маршрут.');
+    } finally {
+      setLoading(false);
     }
-    startedAtRef.current = null;
   }
 
   async function exportRide(ride) {
@@ -217,7 +304,7 @@ ${pointsXml}
             ) : (
               <Pressable style={styles.recordButton} disabled={loading} onPress={startRecording}><Text style={styles.recordButtonText}>{loading ? 'ПОЛУЧАЮ GPS…' : '●  НАЧАТЬ ЗАПИСЬ'}</Text></Pressable>
             )}
-            <Text style={styles.hint}>{recording ? 'Идёт запись GPS. Не закрывай приложение.' : 'Нажми, чтобы начать запись нового маршрута.'}</Text>
+            <Text style={styles.hint}>{recording ? 'Идёт фоновая запись GPS. Android показывает уведомление о работе трекера.' : 'Нажми, чтобы начать запись нового маршрута.'}</Text>
           </View>
         </View>
       ) : (
