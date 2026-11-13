@@ -1,6 +1,6 @@
-import test from 'node:test';
-import assert from 'node:assert/strict';
-import { calculateDistance, distanceBetween, isValidRide } from './rideUtils.js';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { calculateDistance, distanceBetween, isValidRide } = require('./rideUtils');
 
 test('distanceBetween returns zero for the same point', () => {
   const point = { latitude: 47.2, longitude: 11.4 };
