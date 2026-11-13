@@ -16,6 +16,26 @@ function distanceBetween(a, b) {
   const x = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.latitude)) * Math.cos(rad(b.latitude)) * Math.sin(dLon / 2) ** 2;
   return 6371000 * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
+function calculateDistance(points) {
+  return points.reduce((sum, point, index) => (
+    index ? sum + distanceBetween(points[index - 1], point) : 0
+  ), 0);
+}
+
+function isValidRide(ride) {
+  return Boolean(
+    ride &&
+    typeof ride.id === 'string' &&
+    Array.isArray(ride.points) &&
+    ride.points.every((point) =>
+      Number.isFinite(point?.latitude) &&
+      Number.isFinite(point?.longitude) &&
+      Math.abs(point.latitude) <= 90 &&
+      Math.abs(point.longitude) <= 180
+    )
+  );
+}
+
 function formatDistance(meters) {
   return meters >= 1000 ? (meters / 1000).toFixed(2) + ' км' : Math.round(meters) + ' м';
 }
@@ -37,14 +57,21 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const watchRef = useRef(null);
   const startedAtRef = useRef(null);
+  const startingRef = useRef(false);
   const mapRef = useRef(null);
 
   const distance = useMemo(() => track.reduce((sum, point, i) => i ? sum + distanceBetween(track[i - 1], point) : 0, 0), [track]);
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY).then((value) => {
-      if (value) setSavedRides(JSON.parse(value));
-    }).catch(() => {});
+      if (!value) return;
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        setSavedRides(parsed.filter(isValidRide).slice(0, 30));
+      }
+    }).catch(() => {
+      Alert.alert('Ошибка истории', 'Не удалось прочитать сохранённые поездки. Новые поездки можно записывать как обычно.');
+    });
     return () => {
       if (watchRef.current) watchRef.current.remove();
     };
@@ -83,32 +110,59 @@ export default function App() {
   }
 
   async function startRecording() {
-    const allowed = await getLocationPermission();
-    if (!allowed) return;
+    if (startingRef.current || recording) return;
+    startingRef.current = true;
     setLoading(true);
     try {
+      const allowed = await getLocationPermission();
+      if (!allowed) return;
+
       const first = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-      const firstPoint = { latitude: first.coords.latitude, longitude: first.coords.longitude, timestamp: first.timestamp };
+      const firstPoint = {
+        latitude: first.coords.latitude,
+        longitude: first.coords.longitude,
+        timestamp: first.timestamp,
+      };
+
       setTrack([firstPoint]);
       setCurrent(firstPoint);
       setElapsed(0);
-      startedAtRef.current = Date.now();
-      setRecording(true);
-      watchRef.current = await Location.watchPositionAsync(
+
+      const subscription = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.High, timeInterval: 3000, distanceInterval: 5 },
         (position) => {
-          const point = { latitude: position.coords.latitude, longitude: position.coords.longitude, timestamp: position.timestamp };
+          const point = {
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            timestamp: position.timestamp,
+          };
           setCurrent(point);
           setTrack((previous) => {
             const last = previous[previous.length - 1];
             if (last && distanceBetween(last, point) < 3) return previous;
             return [...previous, point];
           });
+        },
+        () => {
+          Alert.alert('Проблема GPS', 'Поток GPS прервался. Останови запись и проверь геолокацию.');
         }
       );
+
+      watchRef.current = subscription;
+      startedAtRef.current = Date.now();
+      setRecording(true);
     } catch {
+      if (watchRef.current) {
+        watchRef.current.remove();
+        watchRef.current = null;
+      }
+      startedAtRef.current = null;
+      setRecording(false);
+      setTrack([]);
+      setElapsed(0);
       Alert.alert('Ошибка GPS', 'Не удалось начать запись. Проверь разрешения и включённую геолокацию.');
     } finally {
+      startingRef.current = false;
       setLoading(false);
     }
   }
@@ -118,12 +172,19 @@ export default function App() {
       watchRef.current.remove();
       watchRef.current = null;
     }
+    const finalElapsed = startedAtRef.current
+      ? Math.floor((Date.now() - startedAtRef.current) / 1000)
+      : elapsed;
+    const finalDistance = calculateDistance(track);
     setRecording(false);
+    setElapsed(finalElapsed);
+    startedAtRef.current = null;
+
     const ride = {
       id: String(Date.now()),
       date: new Date().toLocaleString(),
-      distance,
-      duration: elapsed,
+      distance: finalDistance,
+      duration: finalElapsed,
       points: track,
     };
     if (track.length > 1) {
@@ -131,14 +192,13 @@ export default function App() {
       setSavedRides(updated);
       try {
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-        Alert.alert('Поездка сохранена', `Трек: ${formatDistance(distance)} • ${formatDuration(elapsed)}`);
+        Alert.alert('Поездка сохранена', `Трек: ${formatDistance(finalDistance)} • ${formatDuration(finalElapsed)}`);
       } catch {
         Alert.alert('Поездка завершена', 'Не удалось сохранить трек в памяти телефона.');
       }
     } else {
       Alert.alert('Запись остановлена', 'GPS-точек пока недостаточно для сохранения маршрута.');
     }
-    startedAtRef.current = null;
   }
 
   async function exportRide(ride) {
@@ -178,10 +238,20 @@ ${pointsXml}
   }
 
   function openRide(ride) {
-    setTrack(ride.points || []);
-    setCurrent(ride.points?.[ride.points.length - 1] || null);
-    setScreen('map');
+    if (!isValidRide(ride)) {
+      Alert.alert('Поездка недоступна', 'Данные этого маршрута повреждены.');
+      return;
+    }
+    if (watchRef.current) {
+      watchRef.current.remove();
+      watchRef.current = null;
+    }
+    startedAtRef.current = null;
     setRecording(false);
+    setTrack(ride.points);
+    setCurrent(ride.points[ride.points.length - 1] || null);
+    setElapsed(Number.isFinite(ride.duration) ? Math.max(0, ride.duration) : 0);
+    setScreen('map');
   }
 
   return (
